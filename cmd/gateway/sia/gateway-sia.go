@@ -28,17 +28,17 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/fatih/color"
 	"github.com/minio/cli"
-	"github.com/minio/minio-go/v6/pkg/set"
 	minio "github.com/minio/minio/cmd"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/sha256-simd"
+	"gitlab.com/NebulousLabs/Sia/modules"
+	"gitlab.com/NebulousLabs/Sia/node/api/client"
 )
 
 const (
@@ -47,10 +47,9 @@ const (
 
 type siaObjects struct {
 	minio.GatewayUnsupported
-	Address  string // Address and port of Sia Daemon.
-	TempDir  string // Temporary storage location for file transfers.
-	RootDir  string // Root directory to store files on Sia.
-	password string // Sia password for uploading content in authenticated manner.
+	Address string // Address and port of Sia Daemon.
+	RootDir string // Root directory to store files on Sia.
+	client  *client.Client
 }
 
 // closeResponse close non nil response with any response Body.
@@ -147,35 +146,22 @@ func (g *Sia) Name() string {
 // NewGatewayLayer returns Sia gateway layer, implements ObjectLayer interface to
 // talk to Sia backend.
 func (g *Sia) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) {
+	addr := g.host
+
+	if addr == "" {
+		addr = "127.0.0.1:9980"
+	}
+
 	sia := &siaObjects{
 		Address: g.host,
 		// RootDir uses access key directly, provides partitioning for
 		// concurrent users talking to same sia daemon.
-		RootDir:  creds.AccessKey,
-		TempDir:  os.Getenv("SIA_TEMP_DIR"),
-		password: os.Getenv("SIA_API_PASSWORD"),
-	}
-
-	// If Address not provided on command line or ENV, default to:
-	if sia.Address == "" {
-		sia.Address = "127.0.0.1:9980"
-	}
-
-	// If local Sia temp directory not specified, default to:
-	if sia.TempDir == "" {
-		sia.TempDir = ".sia_temp"
-	}
-
-	var err error
-	sia.TempDir, err = filepath.Abs(sia.TempDir)
-	if err != nil {
-		return nil, err
-	}
-
-	// Create the temp directory with proper permissions.
-	// Ignore error when dir already exists.
-	if err = os.MkdirAll(sia.TempDir, 0700); err != nil {
-		return nil, err
+		RootDir: creds.AccessKey,
+		client: client.New(client.Options{
+			Address:   addr,
+			UserAgent: "Sia-Agent",
+			Password:  os.Getenv("SIA_API_PASSWORD"),
+		}),
 	}
 
 	colorBlue := color.New(color.FgBlue).SprintfFunc()
@@ -184,7 +170,6 @@ func (g *Sia) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error)
 	formatStr := "%" + fmt.Sprintf("%ds", len(sia.Address)+7)
 	logger.StartupMessage(colorBlue("\nSia Configuration:"))
 	logger.StartupMessage(colorBlue("  API Address:") + colorBold(fmt.Sprintf(formatStr, sia.Address)))
-	logger.StartupMessage(colorBlue("  Staging Directory:") + colorBold(fmt.Sprintf(" %s", sia.TempDir)))
 
 	return sia, nil
 }
@@ -233,148 +218,6 @@ func (s MethodNotSupported) Error() string {
 	return fmt.Sprintf("API call not recognized: %s", s.method)
 }
 
-// apiGet wraps a GET request with a status code check, such that if the GET does
-// not return 2xx, the error will be read and returned. The response body is
-// not closed.
-func apiGet(ctx context.Context, addr, call, apiPassword string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", "http://"+addr+call, nil)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "Sia-Agent")
-	if apiPassword != "" {
-		req.SetBasicAuth("", apiPassword)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return nil, err
-	}
-	if resp.StatusCode == http.StatusNotFound {
-		closeResponse(resp)
-		logger.LogIf(ctx, MethodNotSupported{call})
-		return nil, MethodNotSupported{call}
-	}
-	if non2xx(resp.StatusCode) {
-		err := decodeError(resp)
-		closeResponse(resp)
-		logger.LogIf(ctx, err)
-		return nil, err
-	}
-	return resp, nil
-}
-
-func apiStream(ctx context.Context, addr, siapath, apiPassword string, start, length int64) (*http.Response, error) {
-	os.Stdout.WriteString("STREAM http://" + addr + "/renter/stream/" + siapath + "\n")
-
-	req, err := http.NewRequest("GET", "http://"+addr+"/renter/stream/"+siapath, nil)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "Sia-Agent")
-	if apiPassword != "" {
-		req.SetBasicAuth("", apiPassword)
-	}
-
-	os.Stdout.WriteString(fmt.Sprintf("bytes=%d-%d\n", start, length))
-
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, length))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return nil, err
-	}
-	if resp.StatusCode == http.StatusNotFound {
-		closeResponse(resp)
-		logger.LogIf(ctx, MethodNotSupported{"/renter/stream"})
-		return nil, MethodNotSupported{"/renter/stream"}
-	}
-	os.Stdout.WriteString(fmt.Sprintf("STATUS CODE: %d\n", resp.StatusCode))
-	if non2xx(resp.StatusCode) {
-		err := decodeError(resp)
-		closeResponse(resp)
-		logger.LogIf(ctx, err)
-		return nil, err
-	}
-
-	return resp, nil
-}
-
-// apiPost wraps a POST request with a status code check, such that if the POST
-// does not return 2xx, the error will be read and returned. The response body
-// is not closed.
-func apiPost(ctx context.Context, addr, call, vals, apiPassword string) (*http.Response, error) {
-	os.Stdout.WriteString("APIPOST, http://" + addr + call + "\n")
-	req, err := http.NewRequest("POST", "http://"+addr+call, strings.NewReader(vals))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "Sia-Agent")
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if apiPassword != "" {
-		req.SetBasicAuth("", apiPassword)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return nil, err
-	}
-
-	if resp.StatusCode == http.StatusNotFound {
-		closeResponse(resp)
-		return nil, MethodNotSupported{call}
-	}
-
-	if non2xx(resp.StatusCode) {
-		err := decodeError(resp)
-		closeResponse(resp)
-		return nil, err
-	}
-	return resp, nil
-}
-
-// post makes an API call and discards the response. An error is returned if
-// the response status is not 2xx.
-func post(ctx context.Context, addr, call, vals, apiPassword string) error {
-	resp, err := apiPost(ctx, addr, call, vals, apiPassword)
-	if err != nil {
-		return err
-	}
-	closeResponse(resp)
-	return nil
-}
-
-// list makes a lists all the uploaded files, decodes the json response.
-func list(ctx context.Context, addr string, apiPassword string, obj *renterFiles) error {
-	resp, err := apiGet(ctx, addr, "/renter/files", apiPassword)
-	if err != nil {
-		return err
-	}
-	defer closeResponse(resp)
-
-	if resp.StatusCode == http.StatusNoContent {
-		logger.LogIf(ctx, fmt.Errorf("Expecting a response, but API returned %s", resp.Status))
-		return fmt.Errorf("Expecting a response, but API returned %s", resp.Status)
-	}
-	err = json.NewDecoder(resp.Body).Decode(obj)
-	logger.LogIf(ctx, err)
-	return err
-}
-
-// get makes an API call and discards the response. An error is returned if the
-// responsee status is not 2xx.
-func get(ctx context.Context, addr, call, apiPassword string) error {
-	resp, err := apiGet(ctx, addr, call, apiPassword)
-	if err != nil {
-		return err
-	}
-	closeResponse(resp)
-	return nil
-}
-
 // Shutdown saves any gateway metadata to disk
 // if necessary and reload upon next restart.
 func (s *siaObjects) Shutdown(ctx context.Context) error {
@@ -386,111 +229,144 @@ func (s *siaObjects) StorageInfo(ctx context.Context, _ bool) (si minio.StorageI
 	return si, nil
 }
 
+func (s *siaObjects) streamingDownload(ctx context.Context, siapath string, start, length int64) (*http.Response, error) {
+	os.Stdout.WriteString(fmt.Sprintf("Downloading: %s\n", siapath))
+	req, err := s.client.NewRequest("GET", "/renter/stream/"+siapath, nil)
+
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, length))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode == http.StatusNotFound {
+		closeResponse(resp)
+		return nil, MethodNotSupported{"/renter/stream"}
+	}
+
+	if non2xx(resp.StatusCode) {
+		err := decodeError(resp)
+		closeResponse(resp)
+		return nil, err
+	}
+
+	return resp, nil
+}
+
 // MakeBucket creates a new container on Sia backend.
 func (s *siaObjects) MakeBucketWithLocation(ctx context.Context, bucket, location string, lockEnabled bool) error {
 	if lockEnabled {
 		return minio.NotImplemented{}
 	}
 
-	srcFile := path.Join(s.TempDir, minio.MustGetUUID())
-	defer os.Remove(srcFile)
+	sha256sum := sha256.Sum256([]byte(bucket))
+	siaObj := path.Join(s.RootDir, bucket, hex.EncodeToString(sha256sum[:]))
 
-	writer, err := os.Create(srcFile)
+	bucketPath, err := modules.NewSiaPath(siaObj)
 	if err != nil {
 		return err
 	}
-	if _, err = io.Copy(writer, bytes.NewReader([]byte(""))); err != nil {
-		return err
-	}
 
-	sha256sum := sha256.Sum256([]byte(bucket))
-	var siaObj = path.Join(s.RootDir, bucket, hex.EncodeToString(sha256sum[:]))
-	return post(ctx, s.Address, "/renter/upload/"+siaObj, "source="+srcFile, s.password)
+	return s.client.RenterUploadStreamPost(bytes.NewReader([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}), bucketPath, 10, 30, false)
 }
 
 // GetBucketInfo gets bucket metadata.
-func (s *siaObjects) GetBucketInfo(ctx context.Context, bucket string) (bi minio.BucketInfo, err error) {
+func (s *siaObjects) GetBucketInfo(ctx context.Context, bucket string) (minio.BucketInfo, error) {
 	sha256sum := sha256.Sum256([]byte(bucket))
-	var siaObj = path.Join(s.RootDir, bucket, hex.EncodeToString(sha256sum[:]))
-
-	dstFile := path.Join(s.TempDir, minio.MustGetUUID())
-	defer os.Remove(dstFile)
-
-	if err := get(ctx, s.Address, "/renter/download/"+siaObj+"?destination="+url.QueryEscape(dstFile), s.password); err != nil {
-		return bi, err
+	bucketFilePath, err := modules.NewSiaPath(path.Join(s.RootDir, bucket, hex.EncodeToString(sha256sum[:])))
+	if err != nil {
+		return minio.BucketInfo{}, err
 	}
-	return minio.BucketInfo{Name: bucket}, nil
+
+	resp, err := s.client.RenterFileGet(bucketFilePath)
+	if err != nil {
+		return minio.BucketInfo{}, minio.ObjectNotFound{
+			Bucket: bucket,
+		}
+	}
+
+	return minio.BucketInfo{
+		Name:    bucket,
+		Created: resp.File.CreateTime,
+	}, nil
 }
 
 // ListBuckets will detect and return existing buckets on Sia.
 func (s *siaObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketInfo, err error) {
-	sObjs, serr := s.listRenterFiles(ctx, "")
-	if serr != nil {
-		return buckets, serr
+	rootPath, err := modules.NewSiaPath(s.RootDir)
+	if err != nil {
+		return
 	}
 
-	m := make(set.StringSet)
+	directories, err := s.client.RenterDirGet(rootPath)
+	if err != nil {
+		return
+	}
 
-	prefix := s.RootDir + "/"
-	for _, sObj := range sObjs {
-		if strings.HasPrefix(sObj.SiaPath, prefix) {
-			siaObj := strings.TrimPrefix(sObj.SiaPath, prefix)
-			idx := strings.Index(siaObj, "/")
-			if idx > 0 {
-				m.Add(siaObj[0:idx])
-			}
+	for _, dir := range directories.Directories {
+		if dir.SiaPath == rootPath {
+			continue
 		}
-	}
 
-	for _, bktName := range m.ToSlice() {
 		buckets = append(buckets, minio.BucketInfo{
-			Name:    bktName,
+			Name:    dir.Name(),
 			Created: time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC),
 		})
 	}
 
-	return buckets, nil
+	return
 }
 
 // DeleteBucket deletes a bucket on Sia.
 func (s *siaObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
-	sha256sum := sha256.Sum256([]byte(bucket))
-	var siaObj = path.Join(s.RootDir, bucket, hex.EncodeToString(sha256sum[:]))
+	bucketPath, err := modules.NewSiaPath(path.Join(s.RootDir, bucket))
+	if err != nil {
+		return err
+	}
 
-	return post(ctx, s.Address, "/renter/delete/"+siaObj, "", s.password)
+	return s.client.RenterDirDeletePost(bucketPath)
 }
 
 func (s *siaObjects) ListObjects(ctx context.Context, bucket string, prefix string, marker string, delimiter string, maxKeys int) (loi minio.ListObjectsInfo, err error) {
-	siaObjs, siaErr := s.listRenterFiles(ctx, bucket)
-	if siaErr != nil {
-		return loi, siaErr
+	bucketPath, err := modules.NewSiaPath(path.Join(s.RootDir, bucket))
+	if err != nil {
+		return
+	}
+
+	files, err := s.client.RenterDirGet(bucketPath)
+	if err != nil {
+		return
 	}
 
 	loi.IsTruncated = false
 	loi.NextMarker = ""
 
-	root := s.RootDir + "/"
-
 	sha256sum := sha256.Sum256([]byte(bucket))
+	bucketFile := hex.EncodeToString(sha256sum[:])
 	// FIXME(harsha) - No paginated output supported for Sia backend right now, only prefix
 	// based filtering. Once list renter files API supports paginated output we can support
 	// paginated results here as well - until then Listing is an expensive operation.
-	for _, sObj := range siaObjs {
-		name := strings.TrimPrefix(sObj.SiaPath, path.Join(root, bucket)+"/")
+	for _, file := range files.Files {
+		name := path.Base(file.Name())
+
 		// Skip the file created specially when bucket was created.
-		if name == hex.EncodeToString(sha256sum[:]) {
+		if name == bucketFile {
 			continue
 		}
+
 		if strings.HasPrefix(name, prefix) {
 			loi.Objects = append(loi.Objects, minio.ObjectInfo{
-				Bucket: bucket,
-				Name:   name,
-				Size:   int64(sObj.Filesize),
-				IsDir:  false,
+				Bucket:  bucket,
+				Name:    name,
+				ModTime: file.ChangeTime,
+				Size:    int64(file.Filesize),
+				IsDir:   false,
 			})
 		}
 	}
-	return loi, nil
+
+	return
 }
 
 // GetObjectNInfo - returns object info and locked object ReadCloser
@@ -519,15 +395,10 @@ func (s *siaObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 }
 
 func (s *siaObjects) GetObject(ctx context.Context, bucket string, object string, startOffset int64, length int64, writer io.Writer, etag string, opts minio.ObjectOptions) error {
-	dstFile := path.Join(s.TempDir, minio.MustGetUUID())
-	defer os.Remove(dstFile)
-
-	var siaObj = path.Join(s.RootDir, url.PathEscape(bucket), url.PathEscape(object))
-	resp, err := apiStream(ctx, s.Address, siaObj, s.password, startOffset, length)
+	siaObj := path.Join(s.RootDir, url.PathEscape(bucket), url.PathEscape(object))
+	resp, err := s.streamingDownload(ctx, siaObj, startOffset, length)
 	if err != nil {
-		os.Stdout.WriteString(err.Error())
 		if strings.Contains(err.Error(), "path does not exist") {
-
 			return minio.ObjectNotFound{
 				Bucket: bucket,
 				Object: object,
@@ -543,82 +414,72 @@ func (s *siaObjects) GetObject(ctx context.Context, bucket string, object string
 	return err
 }
 
-// findSiaObject retrieves the siaObjectInfo for the Sia object with the given
-// Sia path name.
-func (s *siaObjects) findSiaObject(ctx context.Context, bucket, object string) (siaObjectInfo, error) {
-	siaPath := path.Join(s.RootDir, bucket, object)
-
-	sObjs, err := s.listRenterFiles(ctx, "")
-	if err != nil {
-		return siaObjectInfo{}, err
-	}
-
-	for _, sObj := range sObjs {
-		if sObj.SiaPath == siaPath {
-			return sObj, nil
-		}
-	}
-	logger.LogIf(ctx, minio.ObjectNotFound{
-		Bucket: bucket,
-		Object: object,
-	})
-	return siaObjectInfo{}, minio.ObjectNotFound{
-		Bucket: bucket,
-		Object: object,
-	}
-}
-
 // GetObjectInfo reads object info and replies back ObjectInfo
 func (s *siaObjects) GetObjectInfo(ctx context.Context, bucket string, object string, opts minio.ObjectOptions) (minio.ObjectInfo, error) {
-	so, err := s.findSiaObject(ctx, bucket, object)
+	objectPath, err := modules.NewSiaPath(path.Join(s.RootDir, bucket, object))
 	if err != nil {
 		return minio.ObjectInfo{}, err
+	}
+
+	so, err := s.client.RenterFileGet(objectPath)
+	if err != nil {
+		return minio.ObjectInfo{}, minio.ObjectNotFound{
+			Bucket: bucket,
+			Object: object,
+		}
 	}
 
 	// Metadata about sia objects is just quite minimal. Sia only provides file size.
 	return minio.ObjectInfo{
 		Bucket:  bucket,
 		Name:    object,
-		ModTime: time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC),
-		Size:    int64(so.Filesize),
+		ModTime: so.File.ChangeTime,
+		Size:    int64(so.File.Filesize),
 		IsDir:   false,
 	}, nil
 }
 
 // PutObject creates a new object with the incoming data,
 func (s *siaObjects) PutObject(ctx context.Context, bucket, object string, r *minio.PutObjReader, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
-	data := r.Reader
-	srcFile := path.Join(s.TempDir, minio.MustGetUUID())
-	writer, err := os.Create(srcFile)
+	bucketPath, err := modules.NewSiaPath(path.Join(s.RootDir, bucket))
 	if err != nil {
-		return objInfo, err
+		return
 	}
 
-	wsize, err := io.CopyN(writer, data, data.Size())
-	if err != nil {
-		os.Remove(srcFile)
-		return objInfo, err
+	if _, err = s.client.RenterDirGet(bucketPath); err != nil {
+		return minio.ObjectInfo{}, minio.BucketNotFound{
+			Bucket: bucket,
+		}
 	}
 
-	if err = post(ctx, s.Address, "/renter/upload/"+path.Join(s.RootDir, url.PathEscape(bucket), url.PathEscape(object)), "source="+srcFile, s.password); err != nil {
-		os.Remove(srcFile)
-		return objInfo, err
+	objectPath, err := modules.NewSiaPath(path.Join(s.RootDir, bucket, object))
+	if err != nil {
+		return
 	}
+
+	if err = s.client.RenterUploadStreamPost(r.Reader, objectPath, 10, 30, false); err != nil {
+		return
+	}
+
+	file, err := s.client.RenterFileGet(objectPath)
 
 	return minio.ObjectInfo{
 		Name:    object,
 		Bucket:  bucket,
-		ModTime: time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC),
-		Size:    wsize,
+		ModTime: file.File.ChangeTime,
+		Size:    int64(file.File.Filesize),
 		ETag:    minio.GenETag(),
 	}, nil
 }
 
 // DeleteObject deletes a blob in bucket
 func (s *siaObjects) DeleteObject(ctx context.Context, bucket string, object string) error {
-	// Tell Sia daemon to delete the object
-	var siaObj = path.Join(s.RootDir, bucket, object)
-	return post(ctx, s.Address, "/renter/delete/"+siaObj, "", s.password)
+	objectPath, err := modules.NewSiaPath(path.Join(s.RootDir, bucket, object))
+	if err != nil {
+		return err
+	}
+
+	return s.client.RenterFileDeletePost(objectPath)
 }
 
 func (s *siaObjects) DeleteObjects(ctx context.Context, bucket string, objects []string) ([]error, error) {
@@ -627,69 +488,6 @@ func (s *siaObjects) DeleteObjects(ctx context.Context, bucket string, objects [
 		errs[idx] = s.DeleteObject(ctx, bucket, object)
 	}
 	return errs, nil
-}
-
-// siaObjectInfo represents object info stored on Sia
-type siaObjectInfo struct {
-	SiaPath        string  `json:"siapath"`
-	LocalPath      string  `json:"localpath"`
-	Filesize       uint64  `json:"filesize"`
-	Available      bool    `json:"available"`
-	Renewing       bool    `json:"renewing"`
-	Redundancy     float64 `json:"redundancy"`
-	UploadProgress float64 `json:"uploadprogress"`
-}
-
-type renterFiles struct {
-	Files []siaObjectInfo `json:"files"`
-}
-
-// listRenterFiles will return a list of existing objects in the bucket provided
-func (s *siaObjects) listRenterFiles(ctx context.Context, bucket string) (siaObjs []siaObjectInfo, err error) {
-	// Get list of all renter files
-	var rf renterFiles
-	if err = list(ctx, s.Address, s.password, &rf); err != nil {
-		return siaObjs, err
-	}
-
-	var prefix string
-	root := s.RootDir + "/"
-	if bucket == "" {
-		prefix = root
-	} else {
-		prefix = root + bucket + "/"
-	}
-
-	for _, f := range rf.Files {
-		if strings.HasPrefix(f.SiaPath, prefix) {
-			siaObjs = append(siaObjs, f)
-		}
-	}
-
-	return siaObjs, nil
-}
-
-// deleteTempFileWhenUploadCompletes checks the status of a Sia file upload
-// until it reaches 100% upload progress, then deletes the local temp copy from
-// the filesystem.
-func (s *siaObjects) deleteTempFileWhenUploadCompletes(ctx context.Context, tempFile string, bucket, object string) {
-	var soi siaObjectInfo
-	// Wait until 100% upload instead of 1x redundancy because if we delete
-	// after 1x redundancy, the user has to pay the cost of other hosts
-	// redistributing the file.
-	for soi.UploadProgress < 100.0 {
-		var err error
-		soi, err = s.findSiaObject(ctx, bucket, object)
-		if err != nil {
-			break
-		}
-
-		// Sleep between each check so that we're not hammering
-		// the Sia daemon with requests.
-		time.Sleep(15 * time.Second)
-	}
-
-	os.Remove(tempFile)
 }
 
 // IsCompressionSupported returns whether compression is applicable for this layer.
