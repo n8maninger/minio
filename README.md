@@ -1,87 +1,10 @@
 # MinIO Quickstart Guide
-[![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io) [![Docker Pulls](https://img.shields.io/docker/pulls/minio/minio.svg?maxAge=604800)](https://hub.docker.com/r/minio/minio/)
 
-[![MinIO](https://raw.githubusercontent.com/minio/minio/master/.github/logo.svg?sanitize=true)](https://min.io)
+MinIO is a High Performance Object Storage released under Apache License v2.0. It is API compatible with Amazon S3 cloud storage service. This fork of MinIO readds the [Sia Decentralized Storage](https://sia.tech) gateway
 
-MinIO is a High Performance Object Storage released under Apache License v2.0. It is API compatible with Amazon S3 cloud storage service. Use MinIO to build high performance infrastructure for machine learning, analytics and application data workloads.
+## Download Binaries
 
-## Docker Container
-### Stable
-```
-docker pull minio/minio
-docker run -p 9000:9000 minio/minio server /data
-```
-
-### Edge
-```
-docker pull minio/minio:edge
-docker run -p 9000:9000 minio/minio:edge server /data
-```
-
-> NOTE: Docker will not display the default keys unless you start the container with the `-it`(interactive TTY) argument. Generally, it is not recommended to use default keys with containers. Please visit MinIO Docker quickstart guide for more information [here](https://docs.min.io/docs/minio-docker-quickstart-guide)
-
-## macOS
-### Homebrew (recommended)
-Install minio packages using [Homebrew](https://brew.sh/)
-```sh
-brew install minio/stable/minio
-minio server /data
-```
-
-> NOTE: If you previously installed minio using `brew install minio` then it is recommended that you reinstall minio from `minio/stable/minio` official repo instead.
-```sh
-brew uninstall minio
-brew install minio/stable/minio
-```
-
-### Binary Download
-| Platform    | Architecture | URL                                                       |
-| ----------  | --------     | ------                                                    |
-| Apple macOS | 64-bit Intel | https://dl.min.io/server/minio/release/darwin-amd64/minio |
-```sh
-chmod 755 minio
-./minio server /data
-```
-
-## GNU/Linux
-### Binary Download
-| Platform   | Architecture | URL                                                      |
-| ---------- | --------     | ------                                                   |
-| GNU/Linux  | 64-bit Intel | https://dl.min.io/server/minio/release/linux-amd64/minio |
-```sh
-wget https://dl.min.io/server/minio/release/linux-amd64/minio
-chmod +x minio
-./minio server /data
-```
-
-| Platform   | Architecture | URL                                                        |
-| ---------- | --------     | ------                                                     |
-| GNU/Linux  | ppc64le      | https://dl.min.io/server/minio/release/linux-ppc64le/minio |
-```sh
-wget https://dl.min.io/server/minio/release/linux-ppc64le/minio
-chmod +x minio
-./minio server /data
-```
-
-## Microsoft Windows
-### Binary Download
-| Platform          | Architecture | URL                                                            |
-| ----------        | --------     | ------                                                         |
-| Microsoft Windows | 64-bit       | https://dl.min.io/server/minio/release/windows-amd64/minio.exe |
-```sh
-minio.exe server D:\Photos
-```
-
-## FreeBSD
-### Port
-Install minio packages using [pkg](https://github.com/freebsd/pkg), MinIO doesn't officially build FreeBSD binaries but is maintained by FreeBSD upstream [here](https://www.freshports.org/www/minio).
-
-```sh
-pkg install minio
-sysrc minio_enable=yes
-sysrc minio_disks=/home/user/Photos
-service minio start
-```
+Binary releases with the Sia gateway are available from the releases page https://github.com/siacentral/minio/releases
 
 ## Install from Source
 Source installation is only intended for developers and advanced users. If you do not have a working Golang environment, please follow [How to install Golang](https://golang.org/doc/install). Minimum version required is [go1.13](https://golang.org/dl/#stable)
@@ -183,7 +106,7 @@ mc admin update <minio alias, e.g., myminio>
 - [The MinIO documentation website](https://docs.min.io)
 
 ## Contribute to MinIO Project
-Please follow MinIO [Contributor's Guide](https://github.com/minio/minio/blob/master/CONTRIBUTING.md)
+Please follow MinIO [Contributor's Guide](https://github.com/siacentral/minio/blob/master/CONTRIBUTING.md)
 
 ## License
 [![FOSSA Status](https://app.fossa.io/api/projects/git%2Bgithub.com%2Fminio%2Fminio.svg?type=large)](https://app.fossa.io/projects/git%2Bgithub.com%2Fminio%2Fminio?ref=badge_large)
